@@ -1,0 +1,483 @@
+---
+title: "Part 2: Model training"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Preparation
+
+In this Notebook we (1) train and test various models to predict the density and probability of presence of the target taxa, (2) calculate variable importance, and (3) make some partial dependence plots to describe the relationship between the response and individual predictors. Here, Figures S3 and S4 are produced.
+
+The needed inputs are the response data (which is in the main root directory), and the predictor brick generated in Part 1.
+
+The main outputs (besides the figures) are the Probability Model, and the Density Model, which will be used in the next part.
+
+### Libraries
+
+Load necessary libraries.
+```{r, message=FALSE, warning = FALSE}
+
+library(raster)
+library(party)
+library(lattice)
+library(spm)
+library(vegan)
+library(dplyr)
+library(raster)
+library(glmnet)
+library(pROC)
+#library(regclass) #VIF
+library(usdm) # VIF
+require(rgdal)
+
+set.seed(4864)
+
+setwd("/home/rstudio/fmars-2020-496688/")
+```
+
+### Paths to data
+
+Specify and/or create paths to data files.
+```{r, message = FALSE, results=FALSE}
+
+ifelse(!dir.exists(file.path(getwd(),"Outputs")), dir.create(file.path(getwd(),"Outputs")), FALSE)
+
+preddatapath <- "Data/PredictorData/_PredictorStack"
+
+
+```
+
+### Specify predictor object
+
+Load the predictor brick.
+```{r}
+
+load(file.path(preddatapath,"pred.RData"))
+# pred
+data.frame(names(pred))
+
+# names(pred) <- c("bathy", "slope", "tpi", "tpi_b", "tri", "roughness", "terclass", "vrm", "landscape", "temp_mean", "temp_max",  "temp_min", "salt_mean", "salt_max", "salt_min", #"spd_mean", "spd_max",   "spd_min", "temp_std", "salt_std", "spd_std", "chl_mean", #"poc_mean", "zlee_mean") # in case you need them (e.g. if saved as .tif)
+
+```
+
+
+### Read in response data
+
+Read the table containing the response data as well as the table containing sampling station information. Join the two on sample (station) id. Optionally, subset the response data. Create a column to split samples into a training set and a testing set.
+```{r}
+
+resp <-  read.csv("Data/ResponseData/resp.csv")
+colnames(resp)[1]<- "VL_number"
+
+sample_info_vl <- read.csv("Data/ResponseData/sample_info_vl.csv")
+
+resp_spat <-merge(resp, sample_info_vl)
+coordinates(resp_spat) = ~X_FIELD+Y_FIELD
+#proj4string(resp_spat)=CRS("+init=esri:32633")
+resp_spat$sample_id <- resp_spat$VL_number
+
+writeOGR(resp_spat, "Data/BaseLayers", "response_spatial", driver="ESRI Shapefile", overwrite_layer=TRUE) # create a shapefile, if needed
+
+resp_spat_sel <- resp_spat # do I need to subset the data? Not in this case...
+
+# randomly select n % of all samples for training
+
+resp_spat_sel$split <- "Train"
+n <- 0.3
+
+#set.seed(68424)
+
+Test_data <- sample(resp_spat_sel$VL_number,as.integer(dim(resp_spat_sel)[1]*n))
+resp_spat_sel$split[which(resp_spat_sel$VL_number%in%Test_data)] <- "Test"
+
+table(resp_spat_sel$split)
+
+```
+
+### Response data check
+
+Have a quick glance at the response data. "TotRich" is the total taxon richness, "QRich" is the total number of taxa that are habitat indicators, in other words, the target taxa (in this case, soft-bottom, deep-sea sponges), "QAbu" is the total abundance of all target taxa, "TotAbu" is the total abundance of all taxa. The variable "QRich" is not used in any analyses in this paper.
+```{r}
+head(resp_spat_sel)
+```
+
+### Extract values
+
+Extract the values from all predictor layers for all the points in the response dataset.
+```{r}
+
+e <- extract(pred, resp_spat_sel)
+v <- data.frame(cbind(resp_spat_sel, e))
+
+v$landscape <- as.factor(v$landscape)
+v$terclass <- as.factor(v$terclass)
+
+str(v)
+
+```
+## Models
+
+The following results are summarized in Table 2 in the paper. Note that the values for variance explained and AUC depend on the seed (which set at the top of this notebook), but they may also vary with the version of the libraries being used!
+
+### Density model using all available observations, all available predictors
+
+First, train a model to predict density using all observations and all predictors. This model will be used later to make spatial predictions. But first, how much variance does it explain?
+```{r}
+
+fmla <- as.formula(paste("QAbu ~ ", 
+                         paste(colnames(v)[(which(colnames(v)=="sample_id")+2):
+                         (which(colnames(v)=="X_FIELD")-1)], collapse= "+"))) # all predictors
+
+#set.seed(4588)
+
+densallall <- cforest(fmla,
+                      data=v, # all observations 
+                      control = cforest_unbiased(ntree=1000,mtry = 3))
+
+
+## how good is this model?
+
+# write a function that generates predictions from the newly trained model and calculates variance explained
+
+howgood <- function(model, data, response){
+  p <- treeresponse(model, data)
+  o <- data[,which(colnames(data)==response)]
+  crosscheck <- data.frame(cbind(unlist(p),o))
+  ve <- vecv(crosscheck$o,crosscheck$V1) # variance explained by cross-validation
+  return(ve)
+}
+
+howgood(densallall, v, "QAbu")
+
+```
+
+### Predictor-only matrix
+
+Create an x object of  all predictors
+```{r}
+
+x <-v[,which(colnames(v)%in%c("sample_id", names(pred)))] # columns with predictors, plus sample id
+x <- x[which(complete.cases(x)),]
+
+x <- x[,-1] # now remove the sample id column
+x <- data.matrix(x)
+
+```
+
+
+### Multicollinearity
+
+Which variables are co-correlated?
+```{r}
+
+vset <- vifstep(data.frame(x), th=10)
+vset@excluded
+
+```
+
+### Density model using all available observations, selected variables
+
+We use this model to report variable importance. But first, how much variance does it explain?
+```{r}
+
+kept <- colnames(x)[-which(colnames(x)%in%vset@excluded)]
+
+fmla <- as.formula(paste("QAbu ~ ", paste(colnames(v)[(which(colnames(v)%in%c(kept)))], collapse= "+")))
+
+#set.seed(45689)
+
+densallsel <- cforest(fmla,
+                       data=v,
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+# how good is this model?
+
+howgood(densallsel, v, "QAbu")
+
+```
+
+### Variable Importance
+```{r}
+
+vi <- varimp(densallsel)
+
+viplot <- dotplot(sort(vi), xlab="Variable Importance", panel = function(x,y){ 
+  panel.dotplot(x, y, col='darkblue', pch=16, cex=1.1) 
+  panel.abline(v=abs(min(vi)), col='red', 
+  lty='longdash', lwd=2
+  )
+  }) 
+
+viplot
+
+```
+
+##### Figure S3. Importance of environmental variables to predict density of soft-bottom, deep-sea sponges (predictors to right of dashed vertical line are significant according to a conditional inference forest model)
+
+### Save plot
+```{r}
+
+tiff(file="FigureS3.tiff",
+width=935, height=551, units="px", res=100)
+viplot
+dev.off()
+
+```
+
+
+### Density model using 70% of observations, all variables
+
+How much variance does the model really explain (i.e., using new data)?
+```{r}
+
+fmla <- as.formula(paste("QAbu ~ ", paste(colnames(v)[(which(colnames(v)=="sample_id")+2):
+                                                       (which(colnames(v)=="X_FIELD")-1)], collapse= "+")))
+
+#set.seed(45689)
+
+dens70all <- cforest(fmla,
+                       data=v[which(v$split=="Train"),],
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+# how good is this model, according to the remaining 30 % observations?
+
+howgood(dens70all, v[which(v$split=="Train"),], "QAbu")
+
+```
+
+### Density model using 70% of observations, selected variables
+
+How much variance does the model really explain when using uncorrelated variables only?
+```{r}
+
+fmla <- as.formula(paste("QAbu ~ ", paste(colnames(v)[(which(colnames(v)%in%c(kept)))], collapse= "+")))
+
+#set.seed(45689)
+
+dens70sel <- cforest(fmla,
+                       data=v[which(v$split=="Train"),],
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+
+# how good is this model, according to the remaining 30 % observations?
+
+howgood(dens70sel, v[which(v$split=="Test"),], "QAbu")
+
+
+```
+
+### Probability model using all available observations and all variables
+
+This model is used later for spatial prediction. How good a classifier is it, though?
+```{r, message = FALSE}
+
+thr <- 0
+
+v$pa <- ifelse(v$QAbu>thr,1,0)
+
+fmla <- as.formula(paste("pa ~ ", paste(colnames(v)[(which(colnames(v)=="sample_id")+2):
+                                                       (which(colnames(v)=="X_FIELD")-1)], collapse= "+")))
+
+#set.seed(112)
+proballall <- cforest(fmla,
+                      data=v,
+                      control = cforest_unbiased(ntree=1000,mtry = 3))
+
+# function to report AUC
+
+howgoodclassif <- function(model, data, response.var, predictions){
+  o <- data[,which(colnames(data)==response.var)]
+  crosscheck <- data.frame(cbind(unlist(predictions),o))
+  accuracy<-pROC::auc(o~V1,crosscheck)
+  return(accuracy)
+}
+
+model <- proballall
+
+predictions <- treeresponse(model, v)
+
+howgoodclassif(model = model, data = v, response.var = "pa", predictions = predictions)
+
+```
+
+Significance of reported accuracy
+```{r, message = FALSE}
+# is the accuracy greater than a random guess?
+
+o <- v[,which(colnames(v)=="pa")]
+crosscheck <- data.frame(cbind(unlist(predictions),o))
+roc.model<-pROC::roc(o~V1,crosscheck)
+
+
+auctest <- function(predictions, data, response){
+  o <- data[,which(colnames(data)==response)]
+  crosscheck <- data.frame(cbind(unlist(predictions),o))
+  roc.model<-pROC::roc(o~V1,crosscheck)
+  crosscheck.shuff<-data.frame(cbind(crosscheck[,1],sample(crosscheck[,2])))
+  roc.null<-pROC::roc(X2~X1,crosscheck.shuff)
+  roctest <- roc.test(roc.model, roc.null, progress = "none")
+  return(roctest)
+}
+
+auctest(predictions, v, "pa")
+```
+
+
+True Skill Statistic
+```{r, warning=FALSE, message=FALSE}
+
+o <- v[,which(colnames(v)=="pa")]
+crosscheck <- data.frame(cbind(unlist(predictions),o))
+roc.model<-pROC::roc(o~V1,crosscheck) # this object could be extracted also from function auctest above (line 327)
+
+best.thres <- coords(roc.model, x = "best", best.method = "youden")$threshold
+best.thres
+
+```
+
+
+### Probability model using all available observations and selected variables
+
+How good a classifier is this model, if we remove colinear predictors?
+```{r, message=FALSE}
+
+fmla <- as.formula(paste("pa ~ ",paste(colnames(v)[(which(colnames(v)%in%c(kept)))], collapse= "+")))
+
+#set.seed(112)
+proballsel <- cforest(fmla,
+                       data=v,
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+
+
+predictions <- treeresponse(proballsel, v)
+
+howgoodclassif(proballsel, v, "pa", predictions)
+
+```
+
+Significance of reported accuracy
+```{r, message=FALSE}
+
+# is the accuracy greater than a random guess?
+
+auctest(predictions, v, "pa")
+
+```
+
+### Probability model using 70 % of available observations and all variables
+
+How good a classifier is really this model?
+```{r, message=FALSE}
+
+fmla <- as.formula(paste("pa ~ ", paste(colnames(v)[(which(colnames(v)=="sample_id")+2):
+                                                       (which(colnames(v)=="X_FIELD")-1)], collapse= "+")))
+
+#set.seed(112)
+
+prob70all <- cforest(fmla,
+                       data=v[which(v$split=="Train"),],
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+
+predictions <- treeresponse(prob70all, v[which(v$split=="Test"),])
+
+howgoodclassif(prob70all, v[which(v$split=="Test"),], "pa", predictions)
+
+```
+
+Significance of reported accuracy
+```{r, message=FALSE}
+
+# is the accuracy greater than a random guess?
+
+auctest(predictions, v[which(v$split=="Test"),], "pa")
+
+```
+
+### Probability model using 70 % of available observations and selected variables
+
+```{r,message=FALSE}
+
+fmla <- as.formula(paste("pa ~ ", paste(colnames(v)[(which(colnames(v)%in%c(kept)))], collapse= "+")))
+
+#set.seed(112)
+
+prob70sel <- cforest(fmla,
+                       data=v[which(v$split=="Train"),],
+                       control = cforest_unbiased(ntree=1000,mtry = 3))
+
+predictions <- treeresponse(prob70sel, v[which(v$split=="Test"),])
+
+howgoodclassif(prob70sel, v[which(v$split=="Test"),], "pa", predictions)
+
+
+```
+
+Significance of reported accuracy
+```{r, message = FALSE}
+
+# is the accuracy greater than a random guess?
+
+auctest(predictions, v[which(v$split=="Test"),], "pa")
+
+```
+
+### Required outputs
+
+```{r}
+
+ifelse(!dir.exists(file.path(getwd(),"Outputs", "Models")), dir.create(file.path(getwd(),"Outputs", "Models")), FALSE)
+
+save(densallall,file=file.path("Outputs/Models", paste(c("densmod","v2",".RData"),collapse ="")))
+save(proballall,file=file.path("Outputs/Models", paste(c("probmod","v2",".RData"),collapse ="")))
+
+```
+
+## Response curves
+
+### More libraries
+
+```{r, warning=FALSE}
+
+library(moreparty)
+library(pdp)
+#library(doParallel)
+
+```
+
+### Partial dependence plots
+
+For this part I used code demonstrated in https://journal.r-project.org/archive/2017/RJ-2017-016/RJ-2017-016.pdf
+```{r}
+
+partdata <- partial(densallall, pred.var = "salt_mean")
+pd1 <- plotPartial(partdata, lwd = 2, ylab = expression(Density))
+
+partdata2 <- partial(densallall, pred.var = "temp_min")
+pd2 <- plotPartial(partdata2, lwd = 2, ylab = expression(Density))
+
+#grid.arrange(pd1, pd2, ncol = 2)
+
+partdata3 <- partial(proballall, pred.var = "salt_mean")
+pd3 <- plotPartial(partdata3, lwd = 2, ylab = expression(Probability))
+
+partdata4 <- partial(proballall, pred.var = "temp_min")
+pd4 <- plotPartial(partdata4, lwd = 2, ylab = expression(Probability))
+
+grid.arrange(pd1, pd2, pd3, pd4, ncol = 2)
+
+```
+##### Figure S4. Partial dependence plots between mean salinity (left) and minimum temperature (right) and expected total density (top) and probability of occurrence (bottom) of soft-bottom, deep-sea sponges (model target taxa), assuming that all other environmental variables are their averages. Mean salinity and minimum temperature were chosen because they were the two predictors that had the most importance in explaining the variability in the response.
+
+### Save plot
+```{r}
+
+tiff(file="FigureS4.tiff",
+width=6, height=6, units="in", res=100)
+grid.arrange(pd1, pd2, pd3, pd4, ncol = 2)
+dev.off()
+
+```

@@ -1,0 +1,480 @@
+---
+title: "Part 1: Processing of environmental data layers"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Introduction
+
+This part describes how to process the environmental layers to produce a predictor brick. The input data includes: bathymetry, oceanographic variables, satellite image data, and landscape type. Note: Blending of oceanographic  layers (from NK800 and B800) is not included here, but feel free to contact me if you need to know the details of how that was done.
+
+Another required input to run this Notebook is a shapefile of the area we are interested in modelling, which we call "mask".
+
+All the required data is in the Data folder which you should have already downloaded, and unzipped into the working directory.
+
+The output from this Notebook is an R stack of all layers, which is required as input for the spatial distribution model. This will be written to a new folder which will be created in this Notebook ("_PredictorStack") as an .RData file.
+
+A bunch of intermediate files with extensions .RData, .tif, and .img will also be written in the PredictorData folder (at the root directory) which weren't there before.
+
+## Setup and inputs
+
+Specify data paths, load libraries.
+```{r setup and inputs, message=FALSE, warning=FALSE}
+
+setwd("/home/rstudio/fmars-2020-496688/")
+
+#Libraries
+library(RCurl)
+library(rgdal)
+library(raster)
+library(rgrass7)
+library(spatialEco) #vrm
+library(cluster) #terrain classification
+library(randomForest) #terrain classification
+
+
+PredictorData = "Data/PredictorData"
+
+```
+
+Load and plot the modelling area
+```{r Load and plot the modelling area}
+
+mask <- readOGR(file.path("Data", "BaseLayers","mask.shp"), verbose = FALSE)
+plot(mask)
+
+```
+
+## Data processing
+
+### Bathymetry and basic derivatives
+
+Bathymetric data was downloaded from EMODnet Bathymetry (EMODnet Bathymetry Consortium (2018): EMODnet Digital Bathymetry (DTM). http://doi.org/10.12770/18ff0d48-b203-4a65-94a9-5fd8b0ec35f6). The tiles used were B5, B6, B7, B8, C5, C6, C7. These were mosaicked into one single layer elsewhere, and are provided as a single geotiff file in the data folder.
+
+All variables that are computed at multiple scales are presented in Table 1.
+
+In this block we derive basic terrain variables, including: topographic position index (at two scales), ruggosity, roughness, and slope.
+```{r, message=FALSE, warning = FALSE}
+
+bas_derivatives <- file.path(PredictorData, "t1.RData")
+
+if(file.exists(bas_derivatives)) {
+  print('basic terrain variables have already been derived')
+  load(bas_derivatives)
+  t1
+  
+  bathy <- raster(file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"))# load bathy file
+  projection(bathy)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+  bathy <- mask(bathy,mask)
+  
+  writeRaster(bathy,file.path(PredictorData, "bathy.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+  
+} else {
+
+  #bathy
+  ### ADDED:
+  bathy <- raster(file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"))# load bathy file
+  projection(bathy)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+  bathy <- mask(bathy,mask)
+  ###
+  ## derive terrain variables
+  tpi <- terrain(bathy, opt=c('tpi')) # included in Table 1
+
+  # TPI for different neighborhood size:
+  tpiw <- function(x, w=5) {
+	  m <- matrix(1/(w^2-1), nc=w, nr=w)
+	  m[ceiling(0.5 * length(m))] <- 0
+	  f <- focal(x, m)
+	  x - f
+  }
+
+  tpi_b <- tpiw(bathy, w=15) # included in Table 1
+  names(tpi_b) <- "tpi_b"
+  
+  tri <- terrain(bathy, opt=c('tri'))
+  rough <- terrain(bathy, opt=c('roughness'))
+  slope <- terrain(bathy, opt=c('slope'))
+
+  t1 <- stack(slope,
+              tpi,
+              tpi_b,
+              tri,
+              rough
+              )
+
+  save(t1,file=file.path(PredictorData, "t1.RData"))
+  
+  rm(slope,
+     tpi,
+     tpi_b,
+     tri,
+     rough
+     )
+  
+  t1
+}
+```
+
+
+### Additional terrain variables
+
+In this block we derive multiscale terrain variables using GRASS, which you need to install prior ro running this part of the workflow. These are all included in Table 1
+```{r message=TRUE, warning=TRUE}
+
+
+method <- c("aspect",
+              #"profc",
+              #"planc",
+              #"longc",
+              #"crosc",
+              #"minic",
+              #"maxic",
+              "feature") # only these two methods are used
+
+win_param_scale <- c(3,19,33) # only these three window sizes are used
+
+add_derivatives <- file.path(PredictorData, "t.RData")
+
+
+try(system('grass78 -c EPSG:32633 -e utm_wgs84_33N/'), silent = TRUE)
+  
+loc <- initGRASS("/usr/lib/grass78/", 
+                  #home = tempdir(),
+                  gisDbase='.', 
+                  #location='utm_wgs84_33N',
+                  mapset='PERMANENT',
+                  override=TRUE)
+
+execGRASS('r.in.gdal', input=file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"),
+            flags=c('overwrite','o','e'), output='elev')     # o= override the prjection parameters, and e=extend the location
+  
+execGRASS('g.region', raster='elev', flags="p", res=as.character(xres(bathy)))
+  
+# win_param_scale <- c(1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35)
+slope_tolerance <- 1.0
+curvature_tolerance <- 0.0001
+exponent <- 0.0
+zscale <- 1.0
+  
+t <- stack()
+  
+for (j in 1:length(method)){
+    
+  for (i in 1:length(win_param_scale)){
+      #print(j,i)
+    execGRASS('r.param.scale', 
+                input='elev', 
+                output=paste(method[j],win_param_scale[i],sep="_"), 
+                size=as.integer(win_param_scale[i]), 
+                slope_tolerance=as.numeric(slope_tolerance), 
+                curvature_tolerance=as.numeric(curvature_tolerance), 
+                method=method[j], 
+                exponent=as.numeric(exponent), 
+                zscale=as.numeric(zscale), 
+                flags=c('overwrite', 'quiet'))
+      
+      #p<-raster(readRAST(paste(method[j], win_param_scale[i],sep="_")))
+      #t <- stack( t , p)
+      
+      print(paste(method[j],win_param_scale[i],sep="_"))
+}}
+    
+execGRASS('i.group', group="stack", subgroup="stack",
+          input=c("aspect_3","aspect_19","aspect_33",
+                  "feature_3","feature_19","feature_33"))
+
+execGRASS("r.out.gdal", input="stack",
+          output=file.path(PredictorData, "stack.img"), format="HFA",
+          flags=c('overwrite', 'quiet'))
+
+
+t <- stack(file.path(PredictorData, "stack.img"))
+names(t) <- paste(rep(method, each = length(win_param_scale)), win_param_scale, sep = "_")
+projection(t)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+
+save(t,file=file.path(PredictorData, "t.RData"))
+
+t
+
+```
+
+
+### Ruggedness
+
+Implementation of the Sappington et al., (2007) vector ruggedness measure, as in the BTM tool
+```{r, message=FALSE}
+
+rugged <- file.path(PredictorData, "vrm.RData")
+
+if(file.exists(rugged)) {
+  print('ruggedness has already been derived')
+  load(rugged)
+  vrm
+  
+} else {
+
+  vrm <- vrm(bathy) 
+  names(vrm) <- "vrm"
+  
+  save(vrm,file=file.path(PredictorData, "vrm.RData"))
+
+  vrm
+
+}
+
+```
+
+
+### Geological data
+
+The landscape layer was downloaded from: http://geo.ngu.no/download/order?lang=en&dataset=705. We provide a clip for the modelling area as an ESRI shapefile in the Data folder
+```{r}
+
+vectordatapath <- file.path(PredictorData, "VectorData")
+
+geo_layers <- file.path(PredictorData, "geo.RData")
+
+if(file.exists(geo_layers)) {
+ print('geo layers have already been derived')
+ load(geo_layers)
+ geo
+  
+} else {
+  
+land <- readOGR(file.path(vectordatapath, "Landscape.shp"))
+land <- spTransform(land,CRS=CRS("+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"))
+
+# make it into a raster
+
+r <- raster(ncol=ncol(bathy), nrow=nrow(bathy))
+extent(r) <- extent(bathy)
+crs(r) <- crs(bathy)
+
+rl <- rasterize(land, r, 'LANDSKAPTY')
+names(rl) <- "landscape"
+
+geo <- mask(crop(rl,mask),mask)
+rm(r, rl)
+
+save(geo,file=file.path(PredictorData, "geo.RData"))
+geo
+  
+}
+
+```
+
+### Oceanographic data
+
+They have been blended (to increase spatial coverage) elsewhere! In the Data folder we provide 14 layers (geotiff format). For salinity, temperature and speed we use (yearly) minimum, maximum, and mean. For current direction (u and v components) we only use the mean (assuming little intra-annual variation)
+```{r, message=FALSE, warning=FALSE}
+
+# a function to read all the .tif files in a directory and make a stack of them
+
+readnstack <- function(filepath, variable, stat) {
+  x <- stack()
+  for (j in 1:length(stat)){
+    for (i in 1:length(variable)){
+      tmpraster <- raster(file.path(filepath,list.files(filepath, pattern = paste(variable[i],stat[j],"tif$",sep=".*"))))
+      x <- stack( x , tmpraster)
+    }
+   # names <- NA
+  #  for (n in 1:(length(variable)*length(stat))){
+   #   names[n] <- paste(levels(expand.grid(variable,stat)[n,1]),levels(expand.grid(variable,stat)[n,2]), sep="_")
+    }
+    names(x) <- gsub("NK800_B800_blended_","",names(x))
+    projection(x) <- "+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+    return(x)
+    
+  }
+
+ocean_layers <- file.path(PredictorData,  "ocean.RData")
+
+if(file.exists(ocean_layers)) {
+ print('ocean layers have already been derived')
+ load(ocean_layers)
+ ocean
+  
+} else {
+
+variable <- c("salt","temp", "spd")
+stat <- c("min", "max", "std")
+  
+o1 <- readnstack(file.path(PredictorData, "Oceanography"), variable, stat)
+
+variable <- c("salt","temp", "spd", "u_bott", "v_bott")
+stat <- c("mean")
+o2 <- readnstack(file.path(PredictorData, "Oceanography"), variable, stat)
+
+ocean_all <- stack(o1,o2)
+ocean_all <- mask(crop(ocean_all,mask),mask)
+
+ocean <- dropLayer(ocean_all,which(grepl("bott", names(ocean_all)))) # these layers will be used differently
+
+## resample
+ocean <- resample(ocean,bathy)
+save(ocean,file=file.path(PredictorData, "ocean.RData"))
+ocean
+}
+
+```
+
+### Terrain classification
+
+Classify terrain according to current direction, aspect, and feature type
+```{r, message=FALSE, warning=FALSE}
+
+t_class <- file.path(PredictorData,  "t.c.RData")
+
+if(file.exists(t_class)) {
+ print('terrain classification has already been completed')
+ load(t_class)
+ print("here is the distribution of values:")
+ table(values(t.c))
+  
+} else {
+  
+# I got the code below from a worked example hosted at the California Soil Resource Lab
+# website but I think it has been removed now, so I am unable to give proper credit!
+
+## Sample from original data, feed samples to PAM algorithm
+
+# we can't operate on the entire set of cells,
+# sample 10000 random points
+
+u <- subset(ocean_all,"u_bott_mean")
+v <- subset(ocean_all,"v_bott_mean")
+
+t <- stack(t,
+           resample(u,t),
+           resample(v,t)
+             )
+
+s.r <- as.data.frame(sampleRegular(t, 10000))
+
+# clara() function: need to remove NA from training set
+
+s.r <- na.omit(s.r)
+s.clara <- clara(s.r, stand=TRUE, k=8)
+s.r$cluster <- factor(s.clara$clustering)
+
+##Use randomForest() to apply cluster rules at unsampled grid cells
+
+fmla <- as.formula(paste("cluster~ ", paste(names(t)[1:length(names(t))], collapse= "+")))
+
+rf <- randomForest(fmla, data=s.r, importance=TRUE, ntree=201)
+
+# make predictions from rf model, along all cells of input stack
+
+t.c <- predict(t, rf, type='response')
+names(t.c) <- "terclass"
+
+save(t.c,file=file.path(PredictorData, "t.c.RData"))
+
+ table(values(t.c))
+}
+
+```
+
+### Satellite-derived data
+
+This set of data includes Chl A, and Max Euphotic Depth (Zeu Lee), and Particulate organic Carbon. The data from 2006 to 2017 were downloaded from https://oceancolor.gsfc.nasa.gov/cgi/l3, matching the period of MAREANO observations. We provide the data as .img files in the data folder.
+Here we take the mean, and resample from 4km (original resolution) to 800m
+```{r, message=FALSE, warning=FALSE}
+
+## write a function that reads all img files, and puts them in a stack
+
+resamp.img <- function(inputpath, refraster) {
+  files <- list.files(path=inputpath, pattern = "\\.img$")
+  x <- stack()
+  for (i in files) {
+    print(i)
+    tmpraster <-   raster::resample(
+      crop(projectRaster(raster(file.path(inputpath,i)),
+                         crs =("+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0")),
+           refraster),
+      refraster)
+    x <- stack( x , tmpraster)
+    
+  }
+  return(x)
+}
+
+
+surf_layers <- file.path(PredictorData,  "surf.RData")
+
+if(file.exists(surf_layers)) {
+ print('surface layers have already been derived')
+ load(surf_layers)
+ surf
+  
+} else {
+
+chl <- resamp.img(file.path(paste(PredictorData, "SatelliteData", sep = "/"), "CHL_chlor_a"), ocean)
+
+mean_chl <- mean(chl)
+names(mean_chl) <- "chl_mean"
+
+poc <- resamp.img(file.path(paste(PredictorData, "SatelliteData", sep = "/"), "POC_poc"), ocean)
+
+mean_poc <- mean(poc)
+names(mean_poc) <- "poc_mean"
+  
+zlee <- resamp.img(file.path(paste(PredictorData, "SatelliteData", sep = "/"), "ZLEE_Zeu_lee"), ocean)
+
+mean_zlee <- mean(zlee)
+names(mean_zlee) <- "zlee_mean"
+
+surf <- stack(mean_chl,                                   # chlorophyl
+              mean_poc,                                   # particulate organic carbon
+              mean_zlee                                   # euphotic zone depth
+              )
+surf <- mask(crop(surf,mask),mask)
+surf <- resample(surf,bathy)
+
+save(surf,file=file.path(PredictorData, "surf.RData"))
+surf
+}
+
+```
+
+
+## Stacking all layers
+
+Make a raster stack (aka brick) of everything
+```{r, message=FALSE, warning=FALSE}
+
+#pred <- stack(stack(file.path(PredictorData, "t1.tif")),
+#              stack(file.path(PredictorData, "geo.tif")),
+#              stack(file.path(PredictorData, "ocean.tif")),
+#              stack(file.path(PredictorData, "surf.tif")),
+#              raster(file.path(PredictorData, "t.c.tif"))
+#              )
+#names(pred) <- c(names(t1), names(geo), names(ocean),names(surf),names(t.c))
+
+pred <- stack(crop(bathy,geo),
+              crop(t1,geo),
+              crop(vrm,geo),
+              geo,
+              crop(ocean, geo),
+              crop(surf, geo),
+              crop(t.c, geo)
+)
+
+names(pred)[1] <-"bathy"
+
+plot(pred)
+
+```
+
+## Save outputs
+Save the required outputs
+```{r}
+
+ifelse(!dir.exists(file.path(PredictorData, "_PredictorStack")), dir.create(file.path(getwd(), PredictorData, "_PredictorStack")), FALSE)
+
+save(pred,file=file.path(PredictorData, "_PredictorStack", "pred.RData"))
+
+```
+

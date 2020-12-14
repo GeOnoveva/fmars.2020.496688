@@ -1,0 +1,37 @@
+---
+title: "Introduction"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+
+## Introduction
+
+In this repository you will find all the code generated for the paper "Modelling the distribution of habitat-forming, deep-sea sponges in the Barents Sea: the value of data". You should be able to reproduce all results presented in the paper, make some bonus plots, and reproduce Figures 5, S3 and S4 (all other figures in the paper were done in a GIS environment and are unfortunately not reproducible).
+
+Disclaimer: my literacy in R is enough to achieve effectiveness, but it is far from reaching efficiency! Therefore, please forgive the quality of my code. Suggestions for improvements are more than welcome. As a believer of science reproducibility (but only a beginner practitioner of it) I thought it was better to share something less-than-perfect rather than share nothing.
+
+Some of the code is from others sources, and I try to give credit to the original authors whenever possible.
+
+## Download the necessary data
+
+Download the data from the relevant data repository,and unzip it in the working directory
+```{r data download}
+
+setwd("/home/rstudio/fmars-2020-496688/")
+
+url = 'https://zenodo.org/record/4302591/files/Data.zip?download=1'
+
+destfile = 'Data.zip'
+
+download.file(url, destfile, 'auto', quiet = FALSE, mode = "w",
+              cacheOK = TRUE,
+              extra = getOption("download.file.extra"),
+              headers = NULL)
+unzip('Data.zip', exdir = '.')
+
+```
+
+

@@ -1,0 +1,91 @@
+---
+title: "Part 5: Correlation between model predictions and generation of zone files"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Introduction
+
+In this part we calculate some measures of correlation between predictions from either model, to determine the level of agreement between the two models.
+
+Th inputs include the two rasters of predictions generated in Part 4. The outputs include a raster of model correlations, as well as other values, which are described in the text of the accompanying paper.
+
+Here we make an alternative (and more detailed) version of Figure 3.
+
+## Correlation between models
+
+### Libraries and data
+```{r}
+library(raster)
+library(spatialEco)
+library(rgdal)
+library(smoothr)
+
+setwd("/home/rstudio/fmars-2020-496688/")
+
+pred_dens <- raster("Outputs/ModelPredictions/PredictionDens.tif")
+pred_prob <- raster("Outputs/ModelPredictions/PredictionProb.tif")
+
+```
+
+### Calculate overall, and local Pearson correlation
+
+Overall correlation
+```{r}
+overall_rho <- cor(values(pred_dens),values(pred_prob), use = "na.or.complete", method = "pearson")
+overall_rho
+```
+
+Local correlation
+```{r}
+r.cor <- rasterCorrelation(pred_dens, pred_prob, s = 51, type = "pearson")
+plot(r.cor)
+```
+##### Figure s3. Local correlation between prediction of density and prediction of probability of presence of soft-bottom, deep-sea sponges.
+
+### Percent areas in bins
+
+Plot the histogram of all values
+```{r}
+a <- values(r.cor)[which(!(is.nan(values(r.cor))|(is.na(values(r.cor)))))]
+
+hist(a)
+
+```
+
+Percent area with correlation >0.2
+```{r}
+b <- a[which(a>=0.2)]
+length(b)/length(a)
+```
+
+Percent area with correlation between 0 and 0.7
+```{r}
+b <- a[which(a<0.2 & a>-0.2)]
+length(b)/length(a)
+```
+
+Percent area with negative correlation
+```{r}
+b <- a[which(a<(-0.2))]
+length(b)/length(a)
+```
+
+Percent area with correlation >0.7
+```{r}
+b <- a[which(a>=0.7)]
+length(b)/length(a)
+```
+
+
+### Save result
+
+```{r}
+outdatapath <- "Outputs/ModelPredictions"
+writeRaster(r.cor,file.path(outdatapath, "pearson_correlation_51.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+```
+
+
+

@@ -1,0 +1,121 @@
+---
+title: "Part 4: Generation of model (spatial) predictions"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Introduction
+
+In this part we generate predictions from the selected models for the whole of the modelling area.
+
+Inputs are: the models, and the predictor stack. The outputs are two rasters of model predictions.
+
+## Libraries and paths
+
+Load necessary libraries
+```{r,comment=NA}
+
+setwd("/home/rstudio/fmars-2020-496688/")
+library(rgdal)
+
+ifelse(!dir.exists(file.path("Outputs", "ModelPredictions")), dir.create(file.path("Outputs", "ModelPredictions")), FALSE)
+
+```
+
+## Load models
+```{r,comment=NA}
+
+load("Outputs/Models/probmodv2.RData")
+model.prob <- proballall
+
+load("Outputs/Models/densmodv2.RData")
+model.dens <- densallall
+
+```
+
+## Predict
+
+Declare factor variables. Write a function for later use.
+```{r,comment=NA}
+
+## Predict using the raster package function:
+
+# list of factor levels
+
+f1 <- levels(v$landscape)
+f2 <- levels(v$terclass)
+
+f <- list(f1,f2)
+
+names(f) <-c("landscape","terclass")
+
+predfun <- function(m, d, ...) predict(m, newdata=d, ...)
+
+#pc <- raster::predict(pred, model, OOB=TRUE, factors=f, fun=predfun)
+
+## same, in parallel
+
+```
+
+First, run the prediction function for probability model, in parallel.
+```{r,comment=NA}
+
+if("rgrass7" %in% (.packages())){
+  detach("package:rgrass7", unload=TRUE)
+}
+
+
+
+raster::beginCluster()
+
+pc.prob <- clusterR(pred, predict, args=list(model=model.prob, OOB=TRUE, factors=f, fun=predfun, index=1:2))
+
+pc.prob <- pc.prob[[1]]
+
+```
+
+Then run for density model.
+```{r,comment=NA}
+
+beginCluster()
+
+pc.dens <- clusterR(pred, predict, args=list(model=model.dens, OOB=TRUE, factors=f, fun=predfun, index=1:2))
+
+pc.dens <- pc.dens[[1]]
+
+
+
+```
+
+## Plot the predictions
+
+Probability
+```{r}
+plot(pc.prob)
+```
+
+Density
+```{r, message=FALSE}
+plot(pc.dens)
+```
+
+
+## Outputs
+
+Save the results.
+```{r}
+outdatapath <- "Outputs/ModelPredictions"
+
+response.dens <- "Dens"
+response.prob <- "Prob"
+
+writeRaster(pc.prob,file.path(outdatapath, paste0("Prediction", response.prob, ".tif", collapse = NULL)), options="INTERLEAVE=BAND", overwrite=TRUE)
+
+
+writeRaster(pc.dens,file.path(outdatapath, paste0("Prediction", response.dens, ".tif", collapse = NULL)), options="INTERLEAVE=BAND", overwrite=TRUE)
+
+```
+
+

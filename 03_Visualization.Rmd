@@ -1,0 +1,119 @@
+---
+title: "Part 3: Data visualizations"
+author: Rebecca Ross, Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+## Introduction
+
+In this Notebook we make an alternative version of Figure S1, which was done in GIS for the purpose of publication.
+
+## Libraries
+```{r, message=FALSE, warning = FALSE}
+library(rgdal)
+#library(dplyr)
+library(sf)
+library(sp)
+library(raster)
+library(rasterVis)
+library(RColorBrewer)
+library(ggplot2)
+library(scales)
+library(vegan)
+setwd("/home/rstudio/fmars-2020-496688/")
+```
+
+
+## Import a Basemap
+
+Bathymetric contours were derived from GEBCO bathymetry (GEBCO Compilation Group (2020) GEBCO 2020 Grid (doi:10.5285/a29c5465-b138-234d-e053-6c86abc040b9)). In the Data folder we provide this contour shapefile, already made.
+
+The land layer was clipped from a world dataset downloaded from marineregions.org (Flanders Marine Institute (2018). Maritime Boundaries Geodatabase: Maritime Boundaries and Exclusive Economic Zones (200NM), version 10. Available online at http://www.marineregions.org/. https://doi.org/10.14284/312). In the Data folder we provide this shapefile already clipped.
+```{r, message=FALSE, warning = FALSE,comment=NA}
+
+baslay_path <- "Data/BaseLayers"
+
+bathy.line <- readOGR(dsn = baslay_path, layer = "gebbathy_no_top_conts_utm33n")
+land.mask<-readOGR(dsn=baslay_path, layer = "europe_africa_utm33n")
+#sp::plot(bathy.line) #check
+
+in.shp <- readOGR(dsn = baslay_path, layer = "response_spatial")
+
+#hotspots <- readOGR(dsn = "Outputs/ModelPredictions", layer = "high_density_areas")
+
+```
+
+## Fortifications
+
+Used to make shapefiles suitable for ggplotting.
+
+```{r, message=FALSE, warning = FALSE}
+
+my.shp<-fortify(as.data.frame(in.shp))
+ax <-my.shp$coords.x1 # using these to set the zoom x and y limits of the plot
+ay <-my.shp$coords.x2
+
+my.bathy<-fortify(bathy.line)
+
+my.land<-fortify(land.mask)
+
+#my.hotspots <- fortify(hotspots)
+
+```
+
+## Plot the Basemap
+
+```{r, message=FALSE, warning = FALSE}
+# making the basemaps0
+map.bathy<- ggplot()+
+  coord_fixed(xlim=c(min(ax),max(ax)), ylim=c(min(ay), max(ay)))+
+  geom_path(data=my.bathy, colour="grey", aes(x=long, y=lat, group=group))
+ 
+map.bathy.z<- ggplot()+
+  coord_fixed(xlim=c(492468.9345+15000, 788802.8605-15000), ylim=c(7757810.4574+15000,8047794.3707-15000))+
+  geom_path(data=my.bathy, colour="grey", aes(x=long, y=lat, group=group))
+
+map.bathy.z.o<- ggplot()+
+  coord_fixed(xlim=c(492468.9345-1600000, 788802.8605+500000), ylim=c(7757810.4574-3000000,8047794.3707+500000))+
+  geom_path(data=my.bathy, colour="white", aes(x=long, y=lat, group=group))
+
+map.base<-map.bathy +
+  geom_polygon(data=my.land, fill="#f0f0f0", colour="grey", aes(x=long, y=lat, group=group))
+
+map.base.z<-map.bathy.z +
+  geom_polygon(data=my.land, fill="#f0f0f0", colour="grey", aes(x=long, y=lat, group=group))
+
+#map.base.z #check
+  
+```
+
+## Plot the Shapefile map
+
+```{r, message=FALSE, warning = FALSE}
+
+# map with shapefile 
+
+# make the PA column first
+
+my.shp$Hbtt_dm <- decostand(my.shp$QAbu, "pa", na.rm =TRUE)
+
+map.shp<-map.base + 
+  geom_point(data=my.shp, aes(ax, ay, color=factor(Hbtt_dm)))+
+  scale_color_manual(values=c("#d8b365","#5ab4ac"), 
+                     name="Soft-bottom, deep-sea sponges",
+                     labels=c("Absent", "Present"))+
+  labs(x="Eastings", y="Northings")+
+  theme(panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "transparent", colour = NA),
+        plot.background = element_rect(fill = "transparent",colour = NA),
+        axis.text.y = element_text(angle=90),
+        legend.position="bottom",
+        plot.caption = element_text(hjust = 0))
+
+map.shp
+ 
+```
+
+##### Figure S2. Sampling stations colored according to the presence/absence of soft-bottom, deep-sea sponges
+

@@ -1,0 +1,304 @@
+---
+title: "Part 6: Richness and abundance data exploration/analysis"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Introduction
+
+In this final part we compare total taxon richness and total abundance of epibenthic megafauna between zones defined by the predictions, and between detected hotspots (within the high density zone).
+
+You need to have loaded the "pred_prob" and "pred_dens" objects, which are created in Part 5. If they are not in the workspace, go back to that Notebook and run the first block ("Libraries and data").
+
+## Thresholding
+
+### Libraries
+```{r, message=FALSE}
+
+library(rgeos)
+library(sf)
+library(ggplot2)
+library(gridExtra)
+library(BAMMtools)
+library(sampler)
+library(smoothr)
+setwd("/home/rstudio/fmars-2020-496688/")
+
+```
+
+
+### Define threshold value manually and convert to polygon
+
+Define a "threspol" function to reclassify the predicted raster object based on a threshold value, convert it to a polygon, eliminate small features and big holes, and smooth the boundaries. Units are assumed to be km2.
+```{r}
+
+threspol <- function(thresvalue, raster, min.area, max.hole){
+  rcl <- matrix(data = c(0,thresvalue,thresvalue,max(values(raster), na.rm =TRUE),0,1), nrow=2)
+  rec <- reclassify(raster, rcl, include.lowest = TRUE)
+  pol <- rasterToPolygons(rec, fun=function(x){x==1}, dissolve = TRUE)
+  pol <- as(spatialEco::explode(pol), "Spatial")
+  pol$area_sqkm <- area(pol) / 1000000
+  pol <- pol[pol$area_sqkm>min.area,]
+  area_thresh <- units::set_units(max.hole, km^2)
+  pol <- fill_holes(pol, threshold = area_thresh)
+  pol <- smoothr::smooth(pol, method = "ksmooth")
+  pol_dens <- pol
+    return(pol)
+}
+
+```
+
+Density
+```{r}
+
+th <- 13
+pol_dens <- threspol(th, pred_dens, 20, 8)
+
+writeOGR(pol_dens,"Outputs/ModelPredictions", "high_density_areas.shp", driver="ESRI Shapefile")
+
+```
+
+Probability
+```{r}
+th <- 0.75
+#th <- best.thres
+pol_prob <- threspol(th, pred_prob, 20, 8)
+
+writeOGR(pol_prob,"Outputs/ModelPredictions", "high_probability_areas", driver="ESRI Shapefile", overwrite_layer = TRUE)
+
+```
+
+## Boxplot and ANOVA tests for zones
+
+### Classify stations by zone
+```{r}
+
+## determine zones
+
+crs(resp_spat_sel) <- crs(pol_dens)
+
+idx1 <- over(resp_spat_sel, pol_dens)
+
+v$zone <- "Background"
+
+v$zone[which(!is.na(idx1[,1]))] <- "High density"
+
+idx2 <- over(resp_spat_sel, pol_prob)[,1]
+
+idx2 <- which(!is.na(idx2))
+
+idx1 <- which(!is.na(idx1[,1]))
+
+idx2 <- idx2[!idx2 %in% idx1]
+
+v$zone[idx2] <- "High probability"
+
+v$zone <- factor(v$zone, levels=c("Background", "High probability", "High density"))
+
+
+## determine location
+
+cents <- gCentroid(pol_dens, byid = TRUE)
+
+pol_dens@data <- cbind(pol_dens@data,cents@coords)
+
+pol_dens@data$location <- NA
+
+pol_dens@data$location[which(pol_dens@data$x>640000)] <- "Tromsøflaket"
+
+pol_dens@data$location[which(pol_dens@data$y>7964000)] <- "Egga (North)"
+
+pol_dens@data$location[which(pol_dens@data$y<7500000)] <- "Træna Trench"
+
+pol_dens@data$location[which(is.na(pol_dens@data$location))] <- "Egga (South)"
+
+resp_spat_sel1 <- st_join(as(resp_spat_sel, "sf"), as(pol_dens, "sf")["location"], left = TRUE) # join points
+
+v$location <- resp_spat_sel1$location
+
+v$location <- factor(v$location, levels = c("Træna Trench", "Egga (South)", "Tromsøflaket"))
+
+```
+
+### Explore patterns with boxplots
+
+Code to generate the box plots mostly by G. Scheithauer (https://medium.com/@gscheithauer/how-to-add-number-of-observations-to-a-ggplot2-boxplot-b22710f7ef80)
+```{r}
+
+# Compare between zones
+
+stat_box_data <- function(y, upper_limit = max(v$TotRich) * 1.15) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('n =', length(y)#, '\n',
+                    #'mean =', round(mean(y), 1), '\n'
+                    )
+    )
+  )
+}
+
+p1 <- ggplot(v, aes(x=zone, y=TotRich)) + 
+  geom_boxplot() + xlab("Zone") + ylab("Taxon Richness") + stat_summary(
+    fun.data = stat_box_data, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9
+  )
+
+stat_box_data <- function(y, upper_limit = max(log(v$TotAbu)) * 1.15) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('n =', length(y)#, '\n',
+                    #'mean =', round(mean(y), 1), '\n'
+                    )
+    )
+  )
+}
+
+
+p2 <- ggplot(v, aes(x=zone, y=log(TotAbu))) + 
+  geom_boxplot() + xlab("Zone") + ylab("Log of Abundance") + stat_summary(
+    fun.data = stat_box_data, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9
+  )
+
+
+## Compare the four hotspots to one another
+
+stat_box_data <- function(y, upper_limit = max(v$TotRich[which(!is.na(v$location))]) * 1.15) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('n =', length(y)#, '\n',
+                    #'mean =', round(mean(y), 1), '\n'
+                    )
+    )
+  )
+}
+
+
+p3 <- ggplot(v[which(!is.na(v$location)),], aes(x=location, y=TotRich)) + 
+  geom_boxplot() + xlab("Location") + ylab("Taxon Richness") + stat_summary(
+    fun.data = stat_box_data, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9
+  )
+
+
+stat_box_data <- function(y, upper_limit = max(log(v$TotAbu[which(!is.na(v$location))])) * 1.15) {
+  return( 
+    data.frame(
+      y = 0.95 * upper_limit,
+      label = paste('n =', length(y)#, '\n',
+                    #'mean =', round(mean(y), 1), '\n'
+                    )
+    )
+  )
+}
+
+
+p4 <- ggplot(v[which(!is.na(v$location)),], aes(x=location, y=log(TotAbu))) + 
+  geom_boxplot() + xlab("Location") + ylab("Log of Abundance") + stat_summary(
+    fun.data = stat_box_data, 
+    geom = "text", 
+    hjust = 0.5,
+    vjust = 0.9
+  )
+
+grid.arrange(p1,p2,p3,p4, nrow = 2)
+```
+
+### Make figure
+```{r}
+
+#grid.arrange(p1,p2,p3,p4, nrow = 2)
+
+tiff(file = "Figure_5.tif", bg = "transparent")
+grid.arrange(p1,p2,p3,p4, nrow = 2)
+dev.off()
+
+```
+
+### Tests
+
+Here we test for patterns in richness and abundance.
+
+The results shown below are somewhat dependent on the observations used (change the seed to see how much variation there is). We have reported the most common result after trying out a few times. We do not perform a more formal cross-validation at this time because we believe this question (can the model predictions explain patterns in richness and/or abundance?) can be set up (and hopefully will, in the future) in better ways.
+```{r}
+# between zones
+
+# sample 11 stations from each zone, but make sure they represent the richness range (stratified)
+
+set.seed(53405)
+
+idx <- which(v$zone == "Background" & !(is.na(v$TotRich)))
+
+richstrat_1 <- cut(v$TotRich[idx], breaks = getJenksBreaks(v$TotRich[idx], 4),# 3 strata (jenks breaks)
+                   include.lowest = TRUE,
+                   labels = FALSE)
+
+v$richstrat <- NA
+
+v$richstrat[idx] <- richstrat_1
+
+abustrat_1 <- cut(log(v$TotAbu[idx]), breaks = getJenksBreaks(log(v$TotAbu[idx]), 4),# 3 strata (jenks breaks)
+                   include.lowest = TRUE,
+                   labels = FALSE)
+
+v$abustrat <- NA
+
+v$abustrat[idx] <- abustrat_1
+
+
+idx <- which(v$zone == "High probability" & !(is.na(v$TotRich)))
+
+richstrat_2 <- cut(v$TotRich[idx], breaks = getJenksBreaks(v$TotRich[idx], 4),# 3 strata (jenks breaks)
+                   include.lowest = TRUE,
+                   labels = FALSE)
+v$richstrat[idx] <- richstrat_2
+
+
+abustrat_2 <- cut(log(v$TotAbu[idx]), breaks = getJenksBreaks(log(v$TotAbu[idx]), 4),# 3 strata (jenks breaks)
+                   include.lowest = TRUE,
+                   labels = FALSE)
+
+v$abustrat[idx] <- abustrat_2
+
+
+v_ss <- rbind(ssamp(v[which(v$zone == "Background"),], 13, strata=richstrat),
+              ssamp(v[which(v$zone == "High probability"),], 13, strata=richstrat),
+              v[which(v$zone == "High density"),])
+
+test_rich <- aov(TotRich ~ zone, data = v_ss)
+
+
+
+p_value_rich_zones <- round(unlist(summary(test_rich))[9], digits = 3)
+
+
+v_ss <- rbind(ssamp(v[which(v$zone == "Background"),], 13, strata=abustrat),
+              ssamp(v[which(v$zone == "High probability"),], 13, strata=abustrat),
+              v[which(v$zone == "High density"),])
+
+test_abu <- aov(log(TotAbu) ~ zone, data = v_ss)
+
+p_value_abu_zones <- unlist(summary(test_abu))[9]
+
+print(paste("p value for richness test is", p_value_rich_zones[[1]], "p value for abundance test is", round(p_value_abu_zones[[1]],3)))
+
+```
+
+Post-hoc Tukey's test (where difference found)
+```{r}
+
+tukey.test <- TukeyHSD(test_abu)
+tukey.test
+
+```
